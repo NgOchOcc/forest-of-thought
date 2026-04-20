@@ -47,6 +47,9 @@ class Pipeline:
 
         self.infer_times = 0
         self.tokens_per_second_sum = 0
+        self.total_tokens = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
         self.dataname = dataname
 
     def get_respond(self, messages, max_length=1024):
@@ -110,6 +113,8 @@ class Pipeline:
                                                 return_dict=True
                                                 )
         inputs = inputs.to(self.device)
+        input_token_count = inputs['input_ids'].shape[1]
+
         start_time = time.time()
         with torch.no_grad():
             try:
@@ -121,12 +126,18 @@ class Pipeline:
             end_time = time.time()
             inference_time = end_time - start_time
             num_tokens = generated_ids.shape[-1]
+            output_token_count = num_tokens - input_token_count
+
+            # Track tokens
+            self.total_input_tokens += input_token_count
+            self.total_output_tokens += output_token_count
+            self.total_tokens += num_tokens
             self.tokens_per_second_sum += num_tokens / inference_time
 
             generated_ids, average_confidence = self.self_correction(messages, generated_ids)
             outputs = generated_ids[:, inputs['input_ids'].shape[1]:]
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
+
         return response, average_confidence
        
     def get_respond_glm(self, messages, max_length=1024):
@@ -138,6 +149,7 @@ class Pipeline:
                                             )
 
         inputs = inputs.to(self.device)
+        input_token_count = inputs['input_ids'].shape[1]
 
         with torch.no_grad():
             try:
@@ -155,11 +167,19 @@ class Pipeline:
                 print(f"An unexpected error occurred: {e}")
                 return ""
 
+            num_tokens = generated_ids.shape[-1]
+            output_token_count = num_tokens - input_token_count
+
+            # Track tokens
+            self.total_input_tokens += input_token_count
+            self.total_output_tokens += output_token_count
+            self.total_tokens += num_tokens
+
             if self.correction and 'Please refine the your answer according to your Reflection or Feedback.' not in messages[0]['content']:
                 generated_ids = self.self_correction(messages, generated_ids)
             outputs = generated_ids[:, inputs['input_ids'].shape[1]:]
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
+
         return response
     
     def get_respond_qwen(self, messages, max_length):
@@ -173,6 +193,8 @@ class Pipeline:
             add_generation_prompt=True
         )
         inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+        input_token_count = inputs['input_ids'].shape[1]
+
         start_time = time.time()
         generated_ids = self.model.generate(
             **inputs,
@@ -184,8 +206,14 @@ class Pipeline:
         end_time = time.time()
         inference_time = end_time - start_time
         num_tokens = generated_ids.shape[-1]
+        output_token_count = num_tokens - input_token_count
+
+        # Track tokens
+        self.total_input_tokens += input_token_count
+        self.total_output_tokens += output_token_count
+        self.total_tokens += num_tokens
         self.tokens_per_second_sum += num_tokens / inference_time
-    
+
         generated_ids, average_confidence = self.self_correction(messages, generated_ids)
         outputs = generated_ids[:, inputs['input_ids'].shape[1]:]
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -193,7 +221,7 @@ class Pipeline:
         return response, average_confidence
 
     def get_respond_deepseek(self, messages, max_length):
-        
+
         if 'The response should begin with' in messages[0]['content']:
             messages[0]['content'] = messages[0]['content'].split('The response should begin with ')[0]
             messages[0]['content'] += '\nPlease reason step by step, and put your final answer within \\boxed{}."'
@@ -203,11 +231,21 @@ class Pipeline:
             add_generation_prompt=True
         )
         model_inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+        input_token_count = model_inputs['input_ids'].shape[1]
 
         generated_ids = self.model.generate(
             **model_inputs,
             max_new_tokens=1024
         )
+
+        # Calculate output tokens
+        num_generated = generated_ids.shape[-1]
+        output_token_count = num_generated - input_token_count
+
+        # Track tokens
+        self.total_input_tokens += input_token_count
+        self.total_output_tokens += output_token_count
+        self.total_tokens += num_generated
 
         if self.correction:
             generated_ids = self.self_correction(messages, generated_ids)
@@ -267,11 +305,51 @@ class Pipeline:
 
         return generated_ids, average_confidence
     
+    def print_token_statistics(self):
+        """Print token usage statistics"""
+        print("\n" + "="*80)
+        print("TOKEN USAGE STATISTICS")
+        print("="*80)
+        print(f"Total Inferences:        {self.infer_times}")
+        print(f"Total Tokens Used:       {self.total_tokens}")
+        print(f"Total Input Tokens:      {self.total_input_tokens}")
+        print(f"Total Output Tokens:     {self.total_output_tokens}")
+
+        if self.infer_times > 0:
+            print(f"Avg Tokens per Inference: {self.total_tokens / self.infer_times:.2f}")
+            print(f"Avg Input Tokens:       {self.total_input_tokens / self.infer_times:.2f}")
+            print(f"Avg Output Tokens:      {self.total_output_tokens / self.infer_times:.2f}")
+
+        if self.infer_times > 0 and self.tokens_per_second_sum > 0:
+            avg_tokens_per_second = self.tokens_per_second_sum / self.infer_times
+            print(f"Avg Tokens/Second:      {avg_tokens_per_second:.2f}")
+
+        print("="*80 + "\n")
+
+    def log_token_stats_json(self):
+        """Return token statistics as dictionary for logging"""
+        stats = {
+            'total_inferences': self.infer_times,
+            'total_tokens': self.total_tokens,
+            'total_input_tokens': self.total_input_tokens,
+            'total_output_tokens': self.total_output_tokens,
+        }
+
+        if self.infer_times > 0:
+            stats['avg_tokens_per_inference'] = self.total_tokens / self.infer_times
+            stats['avg_input_tokens'] = self.total_input_tokens / self.infer_times
+            stats['avg_output_tokens'] = self.total_output_tokens / self.infer_times
+
+        if self.infer_times > 0 and self.tokens_per_second_sum > 0:
+            stats['avg_tokens_per_second'] = self.tokens_per_second_sum / self.infer_times
+
+        return stats
+
     def generate(self, prompt, history=[], truncate=True, max_new_tokens=1024):
         # history_ = [{"role": "user" if i % 2 ==0 else 'assistant', "content": h} for i,h in enumerate(history)]
         # if truncate:
         #     history_ = history_[-2:]
-        
+
         # messages = history_ + [
         #         {"role": "user", "content": prompt}
         #     ]
